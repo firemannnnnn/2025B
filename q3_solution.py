@@ -37,9 +37,19 @@ def n_SiC_doped(nu, N_cm3=1e18):
     return np.sqrt(np.maximum(n_sq, 0.01))
 
 def n_Si_doped(nu, N_cm3=1e18):
-    """Si折射率：ε∞=11.7 + Drude自由载流子修正"""
+    """Si折射率：Sellmeier色散 + Drude自由载流子修正"""
     nu = np.asarray(nu, dtype=float)
-    n_sq = np.full_like(nu, SI_EPS_INF, dtype=float)
+    
+    # Sellmeier本征折射率
+    lambda_um = 10000.0 / nu
+    B1, C1 = 10.6684293, 0.301516485
+    B2, C2 = 0.003043474, 1.13475115
+    B3, C3 = 1.54133408, 1104.0
+    n_sq = 1 + B1*lambda_um**2/(lambda_um**2-C1) + \
+              B2*lambda_um**2/(lambda_um**2-C2) + \
+              B3*lambda_um**2/(lambda_um**2-C3)
+    
+    # Drude自由载流子修正
     m_s = SI_M_STAR * m0; c_cm = c_light * 100
     n_sq -= (N_cm3*1e6)*e_charge**2 / (4*np.pi**2*eps0*m_s*c_cm**2) / nu**2
     return np.sqrt(np.maximum(n_sq, 0.01))
@@ -125,19 +135,31 @@ def thickness_fft(nu, R, theta0_deg, n_ref):
 # ============================================================
 # 差分进化拟合
 # ============================================================
-def fit_si(nu, R, theta0_deg, d_bounds=(2e-4, 8e-4), multibeam=True):
-    """Si数据差分进化拟合: [d, log10(N_sub)]"""
+def fit_si(nu, R, theta0_deg, d_bounds=(2e-4, 8e-4), multibeam=True, fit_theta=False):
+    """Si数据差分进化拟合: [d, log10(N_sub), theta(可选)]"""
     def objective(params):
-        d, logN = params
+        if fit_theta:
+            d, logN, theta = params
+        else:
+            d, logN = params
+            theta = theta0_deg
         N_sub = 10**logN
         n1 = lambda nu: n_Si_doped(nu, 1e14)
         n2 = lambda nu: n_Si_doped(nu, N_sub)
-        R_th = reflectance_unpolarized(nu, d, theta0_deg, n1, n2, multibeam=multibeam)
+        R_th = reflectance_unpolarized(nu, d, theta, n1, n2, multibeam=multibeam)
         return np.sum((R_th-R)**2)
     
-    result = differential_evolution(objective, bounds=[d_bounds, (17, 20)],
+    if fit_theta:
+        bounds = [d_bounds, (17, 20), (theta0_deg-1, theta0_deg+1)]
+    else:
+        bounds = [d_bounds, (17, 20)]
+    
+    result = differential_evolution(objective, bounds=bounds,
                                      seed=42, maxiter=500, tol=1e-12)
-    return result.x[0], 10**result.x[1], result
+    if fit_theta:
+        return result.x[0], 10**result.x[1], result.x[2], result
+    else:
+        return result.x[0], 10**result.x[1], result
 
 def fit_sic(nu, R, theta0_deg, d_bounds=(3e-4, 1.5e-3), multibeam=True):
     """SiC数据差分进化拟合: [d, log10(N_sub)]"""
@@ -247,14 +269,23 @@ if __name__ == '__main__':
         d_fft, _, _ = thickness_fft(nu_t, R_t, theta, n_ref)
         print(f"    FFT法: d={d_fft*1e4:.4f} μm")
         
-        # 多光束拟合
+        # 多光束拟合（固定入射角）
         d_mb, N_mb, _ = fit_si(nu_t, R_t, theta, multibeam=True)
         R_mb_th = reflectance_unpolarized(nu_t, d_mb, theta,
                                            lambda nu: n_Si_doped(nu, 1e14),
                                            lambda nu: n_Si_doped(nu, N_mb), multibeam=True)
         r2_mb = pearsonr(R_t, R_mb_th)[0]**2
         rmse_mb = np.sqrt(np.mean((R_mb_th-R_t)**2))
-        print(f"    多光束拟合: d={d_mb*1e4:.4f}μm, N_sub={N_mb:.2e}, R²={r2_mb:.4f}, RMSE={rmse_mb:.2f}%")
+        print(f"    多光束拟合(θ固定): d={d_mb*1e4:.4f}μm, N_sub={N_mb:.2e}, R²={r2_mb:.4f}, RMSE={rmse_mb:.2f}%")
+        
+        # 多光束拟合（入射角作为参数）
+        d_mb_theta, N_mb_theta, theta_fit, _ = fit_si(nu_t, R_t, theta, multibeam=True, fit_theta=True)
+        R_mb_theta_th = reflectance_unpolarized(nu_t, d_mb_theta, theta_fit,
+                                                 lambda nu: n_Si_doped(nu, 1e14),
+                                                 lambda nu: n_Si_doped(nu, N_mb_theta), multibeam=True)
+        r2_mb_theta = pearsonr(R_t, R_mb_theta_th)[0]**2
+        rmse_mb_theta = np.sqrt(np.mean((R_mb_theta_th-R_t)**2))
+        print(f"    多光束拟合(θ拟合): d={d_mb_theta*1e4:.4f}μm, N_sub={N_mb_theta:.2e}, θ={theta_fit:.2f}°, R²={r2_mb_theta:.4f}, RMSE={rmse_mb_theta:.2f}%")
         
         # 双光束拟合
         d_db, N_db, _ = fit_si(nu_t, R_t, theta, multibeam=False)
@@ -272,6 +303,8 @@ if __name__ == '__main__':
             'nu': nu, 'R': R, 'nu_t': nu_t, 'R_t': R_t,
             'nu_max': nu_max, 'R_max': R_max, 'nu_min': nu_min, 'R_min': R_min,
             'd_mb': d_mb, 'N_mb': N_mb, 'r2_mb': r2_mb, 'rmse_mb': rmse_mb,
+            'd_mb_theta': d_mb_theta, 'N_mb_theta': N_mb_theta, 'theta_fit': theta_fit,
+            'r2_mb_theta': r2_mb_theta, 'rmse_mb_theta': rmse_mb_theta,
             'd_db': d_db, 'N_db': N_db, 'r2_db': r2_db, 'rmse_db': rmse_db,
             'd_fft': d_fft, 'diff_pct': diff_pct, 'theta': theta
         }
